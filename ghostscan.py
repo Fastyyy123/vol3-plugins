@@ -90,6 +90,32 @@ class GhostScan(interfaces.plugins.PluginInterface):
             yield file_object, delete_pending, None, proc.SectionBaseAddress
 
     @classmethod
+    def _audit_image_path(
+        cls, proc: interfaces.objects.ObjectInterface
+    ) -> Optional[str]:
+        """
+        Returns the image path from SeAuditProcessCreationInfo as a fallback
+
+        The kernel copies the image's NT path into
+        SeAuditProcessCreationInfo.ImageFileName (_OBJECT_NAME_INFORMATION) when
+        the process is created. Unlike ImageFilePointer and the VAD tree, it is
+        not torn down on process exit: it survives for as long as the _EPROCESS
+        itself is alive (i.e. still linked in PsActiveProcessHead), which makes
+        it the only source of a path for already terminated processes. It is
+        cleared once the process object is finally deleted, so it will not be
+        available for processes only reachable through psscan.
+        """
+        try:
+            path = proc.SeAuditProcessCreationInfo.ImageFileName.Name.get_string()
+        except (exceptions.InvalidAddressException, AttributeError):
+            vollog.debug(
+                f"Unable to read SeAuditProcessCreationInfo.ImageFileName for process {proc.UniqueProcessId}"
+            )
+            return None
+
+        return path or None
+
+    @classmethod
     def _vad_checks(
         cls, control_area: interfaces.objects.ObjectInterface, vad_path: str
     ) -> Generator[Tuple[int, Optional[int], Optional[int]], None, None]:
@@ -200,7 +226,10 @@ class GhostScan(interfaces.plugins.PluginInterface):
                 if vad_info:
                     path = vad_info[0]
                 else:
-                    path = renderers.NotAvailableValue()
+                    # Terminated processes have their VAD tree torn down, so fall
+                    # back to the image path the kernel kept in
+                    # SeAuditProcessCreationInfo.ImageFileName
+                    path = self._audit_image_path(proc) or renderers.NotAvailableValue()
 
                 yield (
                     0,
