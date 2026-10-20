@@ -16,7 +16,7 @@
 
 ### 4. `mockingprobe.py`
 * **Module:** `windows.malware.mockingprobe.MockingProbe`
-* **Description:** detector for **[Process Mockingjay](https://heimdalsecurity.com/blog/new-mockingjay-process-injection-method-enables-malware-evade-edr-tools/)** and in-memory code modification in file-backed modules. Inspects hardware **PTE Dirty flags (bit 6)** to verify in-memory page writes, flags anomalous file-backed `EXECUTE_WRITECOPY` / `RWX` VAD permissions, computes targeted Shannon entropy on modified pages to identify packed/encrypted shellcode, and correlates with suspicious execution paths
+* **Description:** detector for **[Process Mockingjay](https://heimdalsecurity.com/blog/new-mockingjay-process-injection-method-enables-malware-evade-edr-tools/)** and in-memory code modification in file-backed modules. Walks every executable file-backed VAD page by page, inspects hardware **PTE Dirty flags (bit 6)** at `NX = 0` to verify in-memory page writes, reads the modified pages back and applies a **Shannon entropy threshold (`> 5`)** to separate shellcode from patched code, and correlates the verdict with suspicious execution paths. `--only-suspicious` prints only modules that pass the entropy threshold together with a dirty page or an anomalous `EXECUTE_WRITECOPY` / `RWX` mapping
 
 ---
 

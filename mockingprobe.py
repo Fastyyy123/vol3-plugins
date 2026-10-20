@@ -1,7 +1,14 @@
 # This file is Copyright 2026 Volatility Foundation and licensed under the Volatility Software License 1.0
 # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
 #
-"""MockingProbe plugin for detecting Process Mockingjay and in-memory code modification."""
+"""MockingProbe plugin for detecting Process Mockingjay and in-memory code modification.
+
+The plugin walks every executable file-backed VAD of a process page by page,
+translates each page through the page tables and looks for pages that are both
+executable (NX = 0) and modified (Dirty = 1). The content of the modified pages
+is read back and scored with the Shannon entropy: a payload that was written
+into an executable mapping scores above ENTROPY_THRESHOLD.
+"""
 
 import collections
 import logging
@@ -15,6 +22,19 @@ from volatility3.framework.renderers import format_hints
 from volatility3.plugins.windows import pslist, vadinfo
 
 vollog = logging.getLogger(__name__)
+
+# Shannon entropy above which the bytes read back from the modified executable
+# pages are treated as an injected payload rather than as patched code.
+ENTROPY_THRESHOLD = 5.0
+
+# Upper bound on the number of dirty pages read back per VAD. Modified pages in
+# an image section are a handful in practice, the bound only keeps the payload
+# buffer small if a whole section was rewritten.
+MAX_DIRTY_PAGES = 1024
+
+# Number of pages sampled for the fallback score (see _generator): used when the
+# mapping has no modified page at all, so there is nothing to read back.
+FALLBACK_SAMPLE_PAGES = 16
 
 
 def calculate_entropy(data: bytes) -> float:
@@ -33,14 +53,16 @@ def calculate_entropy(data: bytes) -> float:
         return 0.0
     data_len = len(non_zero)
     counts = collections.Counter(non_zero)
-    return -sum((count / data_len) * math.log2(count / data_len) for count in counts.values())
+    return -sum(
+        (count / data_len) * math.log2(count / data_len) for count in counts.values()
+    )
 
 
 class MockingProbe(interfaces.plugins.PluginInterface):
     """Detects Process Mockingjay and in-memory code patching using PTE Dirty bits and entropy."""
 
     _required_framework_version = (2, 22, 0)
-    _version = (1, 0, 0)
+    _version = (1, 1, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -58,7 +80,7 @@ class MockingProbe(interfaces.plugins.PluginInterface):
             ),
             requirements.BooleanRequirement(
                 name="only_suspicious",
-                description="Display only suspicious modules (Dirty > 0 or anomalous RWX path)",
+                description="Display only suspicious modules (Dirty > 0 or anomalous RWX path, entropy > 5)",
                 default=False,
                 optional=True,
             ),
@@ -77,7 +99,9 @@ class MockingProbe(interfaces.plugins.PluginInterface):
         ]
 
     @staticmethod
-    def _pte_flags(layer: interfaces.layers.TranslationLayerInterface, page: int) -> Tuple[bool, bool, bool]:
+    def _pte_flags(
+        layer: interfaces.layers.TranslationLayerInterface, page: int
+    ) -> Tuple[bool, bool, bool]:
         """Translates a virtual address and retrieves PTE state.
 
         Args:
@@ -89,11 +113,17 @@ class MockingProbe(interfaces.plugins.PluginInterface):
         """
         try:
             entry, _ = layer._translate_entry(page & layer.page_mask)
-        except Exception:  # noqa: BLE001
+        except exceptions.InvalidAddressException:
             return (False, False, False)
 
-        # Bit 0: Valid / Present
-        if not (entry & 1):
+        # A page is resident if it is valid. Windows also marks pages as usable
+        # through the transition (bit 11) / prototype (bit 10) bits, so the check
+        # is delegated to the translation layer instead of testing bit 0 alone.
+        page_is_valid = getattr(layer, "_page_is_valid", None)
+        if page_is_valid is not None:
+            if not page_is_valid(entry):
+                return (False, False, False)
+        elif not (entry & 1):
             return (False, False, False)
 
         # Bit 63: XD / No-Execute (0 indicates executable)
@@ -102,6 +132,20 @@ class MockingProbe(interfaces.plugins.PluginInterface):
         is_dirty = ((entry >> 6) & 1) == 1
 
         return (True, is_exec, is_dirty)
+
+    @staticmethod
+    def _read_pages(
+        layer: interfaces.layers.TranslationLayerInterface, pages: List[int]
+    ) -> bytes:
+        """Reads the given pages back from the process address space."""
+        payload = bytearray()
+        for page in pages:
+            try:
+                payload.extend(layer.read(page, layer.page_size, pad=True))
+            except exceptions.InvalidAddressException:
+                # A page can be released between the PTE walk and the read.
+                continue
+        return bytes(payload)
 
     def _generator(self) -> Generator[Tuple[int, Tuple], None, None]:
         kernel = self.context.modules[self.config["kernel"]]
@@ -126,10 +170,17 @@ class MockingProbe(interfaces.plugins.PluginInterface):
 
             layer = self.context.layers[proc_layer_name]
 
-            for vad in proc.get_vad_root().traverse():
+            try:
+                vads = list(proc.get_vad_root().traverse())
+            except exceptions.InvalidAddressException:
+                # Terminated or smeared process: the VAD tree is not walkable.
+                continue
+
+            for vad in vads:
+                # Step 1: only executable file-backed sections are of interest.
                 path = vad.get_file_name()
                 if not isinstance(path, str) or not path:
-                    continue  # Only file-backed VAD nodes are analyzed
+                    continue
 
                 prot = vad.get_protection(
                     vadinfo.VadInfo.protect_values(
@@ -146,7 +197,7 @@ class MockingProbe(interfaces.plugins.PluginInterface):
                 dirty_pages: List[int] = []
                 npages = min((end - start) // layer.page_size + 1, max_pages)
 
-                # Scan PTE flags for all pages in the VAD
+                # Step 2: walk the page tables and look for Dirty = 1 at NX = 0.
                 for i in range(npages):
                     p = start + i * layer.page_size
                     res, ex, dirty = self._pte_flags(layer, p)
@@ -156,74 +207,88 @@ class MockingProbe(interfaces.plugins.PluginInterface):
                             exec_ += 1
                             if dirty:
                                 dirty_exec += 1
-                                if len(dirty_pages) < 8:
+                                if len(dirty_pages) < MAX_DIRTY_PAGES:
                                     dirty_pages.append(p)
 
                 path_lower = path.lower()
                 is_anomalous_path = any(
-                    x in path_lower for x in ["users\\", "temp\\", "programdata\\", "desktop\\", "downloads\\"]
+                    x in path_lower
+                    for x in [
+                        "users\\",
+                        "temp\\",
+                        "programdata\\",
+                        "desktop\\",
+                        "downloads\\",
+                    ]
                 )
                 is_rwx_or_writecopy = ("WRITE" in prot) or ("WRITECOPY" in prot)
                 has_dirty_exec = dirty_exec > 0
 
-                # Targeted entropy calculation:
-                # If modified pages exist, calculate entropy strictly on the dirty pages.
-                # If no dirty pages, sample pages only if the region has anomalous RWX permissions.
-                payload_data = bytearray()
+                # Step 3: read back the modified pages and score their content.
                 if dirty_pages:
-                    for dp in dirty_pages:
-                        try:
-                            pdata = layer.read(dp, layer.page_size, pad=True)
-                            if pdata:
-                                payload_data.extend(pdata)
-                        except Exception:
-                            pass
-                elif is_anomalous_path and is_rwx_or_writecopy:
-                    sample_pages = min(npages, 16)
-                    for i in range(sample_pages):
-                        p = start + i * layer.page_size
-                        try:
-                            pdata = layer.read(p, layer.page_size, pad=True)
-                            if pdata:
-                                payload_data.extend(pdata)
-                        except Exception:
-                            pass
+                    entropy = calculate_entropy(self._read_pages(layer, dirty_pages))
+                else:
+                    # Nothing was ever written through this mapping, so there is
+                    # no modified page to read back. Modules outside the system
+                    # directories that are still mapped writable and executable
+                    # are scored on the image itself, so that a payload placed
+                    # without touching the Dirty bit (copy-on-write break from
+                    # another process) is reported as well.
+                    entropy = 0.0
+                    if is_anomalous_path and is_rwx_or_writecopy:
+                        sample = [
+                            start + i * layer.page_size
+                            for i in range(min(npages, FALLBACK_SAMPLE_PAGES))
+                        ]
+                        entropy = calculate_entropy(self._read_pages(layer, sample))
 
-                entropy = calculate_entropy(payload_data) if payload_data else 0.0
-
-                is_suspicious = has_dirty_exec or (is_rwx_or_writecopy and is_anomalous_path)
+                # Step 4: verdict - high entropy payload on a modified executable
+                # page, or on a writable executable mapping from a user path.
+                looks_like_payload = entropy > ENTROPY_THRESHOLD
+                is_suspicious = looks_like_payload and (
+                    has_dirty_exec or (is_rwx_or_writecopy and is_anomalous_path)
+                )
                 if only_suspicious and not is_suspicious:
                     continue
 
                 module_name = path.split("\\")[-1]
+                dirty_addrs = " ".join(f"0x{x:x}" for x in dirty_pages[:8])
+                if len(dirty_pages) > 8:
+                    dirty_addrs += " ..."
 
-                yield (0, (
-                    pid,
-                    pname,
-                    format_hints.Hex(start),
-                    format_hints.Hex(end),
-                    prot,
-                    resident,
-                    exec_,
-                    dirty_exec,
-                    " ".join(f"0x{x:x}" for x in dirty_pages) if dirty_pages else "N/A",
-                    round(entropy, 2),
-                    module_name,
-                    path,
-                ))
+                yield (
+                    0,
+                    (
+                        pid,
+                        pname,
+                        format_hints.Hex(start),
+                        format_hints.Hex(end),
+                        prot,
+                        resident,
+                        exec_,
+                        dirty_exec,
+                        dirty_addrs if dirty_pages else "N/A",
+                        round(entropy, 2),
+                        module_name,
+                        path,
+                    ),
+                )
 
     def run(self) -> renderers.TreeGrid:
-        return renderers.TreeGrid([
-            ("PID", int),
-            ("Process", str),
-            ("Start", format_hints.Hex),
-            ("End", format_hints.Hex),
-            ("Prot", str),
-            ("Resident", int),
-            ("ExecPages", int),
-            ("Dirty", int),
-            ("DirtyAddrs", str),
-            ("Entropy", float),
-            ("Module", str),
-            ("Path", str),
-        ], self._generator())
+        return renderers.TreeGrid(
+            [
+                ("PID", int),
+                ("Process", str),
+                ("Start", format_hints.Hex),
+                ("End", format_hints.Hex),
+                ("Prot", str),
+                ("Resident", int),
+                ("ExecPages", int),
+                ("Dirty", int),
+                ("DirtyAddrs", str),
+                ("Entropy", float),
+                ("Module", str),
+                ("Path", str),
+            ],
+            self._generator(),
+        )
