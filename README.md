@@ -12,7 +12,8 @@
 ### 3. `ghostscan.py`
 * **Module:** `windows.malware.ghostscan.GhostScan`
 * **Description:** Detects **Process Ghosting** technique. Identifies processes and VAD structures where the underlying on-disk binary has been marked for deletion (`DeletePending = 1`), where the `FILE_OBJECT` pointer is zeroed, or where image sections were mapped with `DeleteOnClose` flags.
-* The official plugin of volatility3 ([windows.malware.processghosting.ProcessGhosting](https://github.com/volatilityfoundation/volatility3/blob/develop/volatility3/framework/plugins/windows/malware/processghosting.py)) has the [architectural limitation](https://github.com/volatilityfoundation/volatility3/blob/3fcb731e0ba5b6c4e90f19445a10f9da2bba02a4/volatility3/framework/plugins/windows/malware/processghosting.py#L207): it does not scan terminated processes. Ghostscan does this
+* The official plugin of volatility3 ([windows.malware.processghosting.ProcessGhosting](https://github.com/volatilityfoundation/volatility3/blob/develop/volatility3/framework/plugins/windows/malware/processghosting.py)) has the [architectural limitation](https://github.com/volatilityfoundation/volatility3/blob/3fcb731e0ba5b6c4e90f19445a10f9da2bba02a4/volatility3/framework/plugins/windows/malware/processghosting.py#L207): it does not scan terminated processes. Ghostscan does this if `--include-terminated` flag specified
+* added a `--pid` flag for filtering on specific process IDs
 
 ### 4. `mockingprobe.py`
 * **Module:** `windows.malware.mockingprobe.MockingProbe`
