@@ -7,7 +7,11 @@
 
 ### 2. `entrypoint_hijack.py`
 * **Module:** `windows.malware.entrypoint_hijack.EntryPointHijack`
-* **Description:** Detects `AddressOfEntryPoint` [code injection](https://www.ired.team/offensive-security/code-injection-process-injection/addressofentrypoint-code-injection-without-virtualallocex-rwx). Parses memory-resident PE headers of the main executable, inspects instructions at the entry point, and identifies inline hooks, trampolines (`JMP`, `CALL`, `PUSH-RET`), and injected shellcode stubs.
+* **Description:** Detects `AddressOfEntryPoint` [code injection](https://www.ired.team/offensive-security/code-injection-process-injection/addressofentrypoint-code-injection-without-virtualallocex-rwx) by **entry point integrity**, not by opcode signatures.
+
+* The technique leaves no new VAD, no changed protection and no modified PE header, but it always breaks the copy-on-write mapping of the page holding the entry point. The plugin resolves the image section's own page through its prototype PTE (the original file content, no disk image needed) and diffs the in-memory entry point against it, so the verdict comes from a byte comparison with the untouched image.
+* output like in `malfind` :)
+* Pages that are trimmed cannot be compared and are reported as `unknown` instead of clean; `--show_all` also prints clean and unverifiable processes, `--pid` filters on process IDs.
 
 ### 3. `ghostscan.py`
 * **Module:** `windows.malware.ghostscan.GhostScan`
